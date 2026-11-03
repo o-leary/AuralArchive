@@ -1,0 +1,223 @@
+name: Docker image
+
+# Builds the AuralArchive image for several architectures and publishes one
+# multi-architecture manifest, so `docker pull` picks the right image on
+# x86_64 servers and on arm64 boards such as the Raspberry Pi 5.
+#
+# Each architecture is built on a native runner rather than under QEMU
+# emulation: the image compiles FFmpeg and the Python toolchain from source,
+# which would take well over an hour per architecture if emulated. Native
+# runners also mean the arm64 build gets arm64 (NEON) code paths in FFmpeg,
+# which is what you want on a Pi.
+#
+# Publishes to ghcr.io under the account that owns this repository, so a fork
+# gets its own images without editing anything. Change IMAGE_NAME below to pin
+# a fixed namespace.
+#
+# Releases are published by tagging a version, e.g. `git tag v1.0.0`.
+# The workflow can also be run by hand from the Actions tab.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Platforms to build, comma separated"
+        required: false
+        default: "linux/amd64,linux/arm64"
+      push:
+        description: "Push the image to ghcr.io (untick to build only)"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: auralarchive
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      arches: ${{ steps.matrix.outputs.arches }}
+      version: ${{ steps.version.outputs.version }}
+      minor: ${{ steps.version.outputs.minor }}
+      image: ${{ steps.version.outputs.image }}
+      build_date: ${{ steps.version.outputs.build_date }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and namespace
+        id: version
+        run: |
+          version="$(tr -d ' \t\n\r' < VERSION)"
+          if [ -z "$version" ]; then
+              echo "ERROR: could not read version from VERSION" >&2
+              exit 1
+          fi
+          # On a tag push, the tag and the version file have to agree, or a
+          # forgotten VERSION bump publishes the wrong version as :latest.
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+              if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+                  echo "ERROR: git tag '${GITHUB_REF_NAME}' does not match VERSION '${version}'" >&2
+                  echo "       bump VERSION (or name the tag v${version}) before releasing" >&2
+                  exit 1
+              fi
+          fi
+          # ghcr.io requires a lowercase namespace.
+          owner="$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # Only a real version tag may move :latest and :<minor>.
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+              echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+              echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Choose a native runner per platform
+        id: matrix
+        env:
+          INPUT: ${{ inputs.platforms }}
+        run: |
+          platforms="${INPUT:-linux/amd64,linux/arm64}"
+          matrix=""
+          arches=""
+          seen=""
+          # Space separated on purpose: entries may be written with a space
+          # after the comma, and duplicates would waste a runner.
+          for platform in $(echo "$platforms" | tr ',' ' '); do
+              case " $seen " in
+                  *" $platform "*) continue ;;
+              esac
+              seen="$seen $platform"
+              case "$platform" in
+                  linux/amd64) arch=amd64; runner=ubuntu-24.04 ;;
+                  linux/arm64) arch=arm64; runner=ubuntu-24.04-arm ;;
+                  *) echo "ERROR: unsupported platform '$platform'" >&2
+                     echo "       supported: linux/amd64, linux/arm64" >&2
+                     exit 1 ;;
+              esac
+              arches="$arches $arch"
+              matrix="$matrix{\"platform\":\"$platform\",\"arch\":\"$arch\",\"runner\":\"$runner\"},"
+          done
+          if [ -z "$matrix" ]; then
+              echo "ERROR: no platforms selected" >&2
+              exit 1
+          fi
+          echo "matrix={\"include\":[${matrix%,}]}" >> "$GITHUB_OUTPUT"
+          echo "arches=$(echo $arches)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to ghcr.io
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # One tag per architecture; the publish job below merges them into one
+      # manifest. Provenance and SBOM are turned off here on purpose: an
+      # attestation attached to a fragment shows up as an unknown/unknown
+      # entry that imagetools would then merge into the release manifest.
+      # The trade-off is that these releases carry no attestations at all;
+      # add them to the merged manifest if you want them.
+      - name: Build ${{ matrix.arch }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name == 'push' || inputs.push }}
+          load: false
+          provenance: false
+          sbom: false
+          tags: ${{ needs.plan.outputs.image }}:${{ needs.plan.outputs.version }}-${{ matrix.arch }}
+          build-args: |
+            APP_VERSION=${{ needs.plan.outputs.version }}
+            BUILD_DATE=${{ needs.plan.outputs.build_date }}
+          # Per-architecture cache scopes: the two arches can never share
+          # layers, and mixing them is what puts foreign-architecture code in
+          # an image. A repository gets 10 GB of Actions cache, and the FFmpeg
+          # and Python build stages are the bulk of that, so the two scopes
+          # may evict each other; the build still works, just slower.
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  publish:
+    needs: [plan, build]
+    if: ${{ github.event_name == 'push' || inputs.push }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Combine the per-architecture images into one manifest list, so the
+      # same tag works on both amd64 and arm64 machines.
+      - name: Publish manifest
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          MINOR: ${{ needs.plan.outputs.minor }}
+          ARCHES: ${{ needs.plan.outputs.arches }}
+          RELEASE: ${{ needs.plan.outputs.release }}
+          SHA: ${{ github.sha }}
+        run: |
+          sources=""
+          for arch in $ARCHES; do
+              sources="$sources ${IMAGE}:${VERSION}-${arch}"
+          done
+
+          # A version tag owns :<version>, :<minor> and :latest. A hand-run
+          # build must not move :latest, which is what the README tells
+          # people to pull, so it publishes a commit-specific tag instead.
+          if [ "$RELEASE" = true ]; then
+              targets=(-t "${IMAGE}:${VERSION}" -t "${IMAGE}:${MINOR}" -t "${IMAGE}:latest")
+          else
+              targets=(-t "${IMAGE}:${VERSION}-dev.${SHA:0:7}")
+          fi
+
+          echo "Combining:${sources}"
+          printf '  -> %s\n' "${targets[@]:1}"
+          # shellcheck disable=SC2086
+          docker buildx imagetools create "${targets[@]}" ${sources# }
+
+      - name: Show manifest
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE: ${{ needs.plan.outputs.release }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$RELEASE" = true ]; then
+              docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+          else
+              docker buildx imagetools inspect "${IMAGE}:${VERSION}-dev.${SHA:0:7}"
+          fi
