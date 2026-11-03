@@ -1,5 +1,6 @@
-# Docker build context is app/. Patterns are anchored to that root, so
-# anything that can appear at any depth needs a **/ prefix.
+# Docker build context is the repository root (the Dockerfile is built with
+# -f docker/Dockerfile .). Patterns are anchored to that root, so anything
+# that can appear at any depth needs a **/ prefix.
 
 # Python
 **/__pycache__/
@@ -49,6 +50,12 @@ backups/
 docker/*
 !docker/entrypoint.sh
 dev/
+
+# Image tarballs written by docker/build.sh. They live inside the repo now,
+# so they must never be sent as build context or COPYed into the next image.
+docker_images/
+**/*.tar
+**/*.tar.gz
 
 # Media files
 media/
