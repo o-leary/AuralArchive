@@ -12,9 +12,15 @@
 #
 # Python is the free-threaded build (no GIL). There is no official image for
 # it, so the standalone build is installed with uv and copied into the image.
+#
+# Architectures: the image is built per architecture (linux/amd64 and
+# linux/arm64, e.g. Raspberry Pi 5), so FFmpeg and Python are compiled
+# natively for each one rather than cross-compiled. Build both with:
+#   docker buildx build --platform linux/amd64,linux/arm64 ...
 
-# CSS build stage
-FROM node:22-slim AS css-builder
+# CSS build stage. The output is plain CSS, so this stage always runs on the
+# build machine's own architecture, even when cross-building for arm64.
+FROM --platform=$BUILDPLATFORM node:22-slim AS css-builder
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json* ./
 # No package-lock.json is committed, so `npm ci` cannot be used until one
@@ -31,6 +37,12 @@ RUN npx @tailwindcss/cli -i tailwind.input.css -o static/css/tailwind.css --mini
 # No --enable-gpl / --enable-nonfree. Only FFmpeg's own components plus
 # libopus (BSD-3-Clause) and zlib (zlib license) are linked in, statically.
 # The final image ships the FFmpeg source tarball and all license texts.
+#
+# FFmpeg and opus are configured for, and compiled on, the target
+# architecture, which is what keeps the arm64 build's optimised (NEON) asm
+# paths working. Building the arm64 variant on an amd64 machine therefore
+# runs under QEMU emulation and is slow (tens of minutes for this stage).
+# docker/build.sh and the GitHub Actions workflow handle it; see those.
 FROM debian:trixie-slim AS ffmpeg-builder
 ARG FFMPEG_VERSION=8.1.3
 ARG FFMPEG_SHA256=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
@@ -90,7 +102,16 @@ RUN mkdir -p /opt/licenses/ffmpeg /opt/licenses/opus /opt/licenses/zlib \
         > /opt/licenses/README.txt
 
 # Python stage: free-threaded interpreter plus dependencies (compilers never
-# reach the final image)
+# reach the final image).
+#
+# uv is copied in on this stage's target architecture, and it downloads the
+# python-build-standalone build for whatever architecture it runs on, so the
+# free-threaded CPython and every wheel land as native code for that
+# architecture - arm64 included. Don't force this stage to $BUILDPLATFORM:
+# that would pull amd64 Python and amd64 wheels into an arm64 image. Also
+# don't bump PYTHON_VERSION past the release uv's index knows about, or the
+# arm64 install fails with "No download found for request:
+# cpython-<ver>+freethreaded-linux-aarch64-gnu".
 FROM debian:trixie-slim AS py-builder
 ARG PYTHON_VERSION=3.14.8
 COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /usr/local/bin/uv
@@ -110,11 +131,13 @@ RUN VIRTUAL_ENV=/opt/venv uv pip install -r requirements.txt
 FROM debian:trixie-slim
 
 ARG APP_VERSION=dev
+ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="AuralArchive" \
       org.opencontainers.image.description="Self-hosted audiobook library manager" \
       org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.source="https://github.com/AuralArchivist/AuralArchive" \
-      org.opencontainers.image.licenses="GPL-3.0"
+      org.opencontainers.image.licenses="GPL-3.0" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
