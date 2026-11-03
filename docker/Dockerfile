@@ -1,7 +1,8 @@
 # AuralArchive container image
 #
-# Build context is app/ (see docker-compose.yml's `context: ..`), so every
-# source path below is relative to app/.
+# Build context is the repository root, so every source path below is relative
+# to it (`COPY docker/entrypoint.sh ...` needs it). Build with:
+#   docker buildx build -f docker/Dockerfile .
 #
 # Storage (see core/paths.py):
 #   /config  app data - settings, database, secrets, cache, logs, backups
@@ -16,7 +17,11 @@
 FROM node:22-slim AS css-builder
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --include=dev
+# No package-lock.json is committed, so `npm ci` cannot be used until one
+# exists. Fall back to a plain install; switch to npm ci once a lockfile is
+# committed for reproducible builds.
+RUN if [ -f package-lock.json ]; then npm ci --include=dev; \
+    else npm install --include=dev --no-audit --no-fund; fi
 COPY frontend/tailwind.input.css ./
 COPY frontend/templates/ ./templates/
 COPY frontend/static/ ./static/
